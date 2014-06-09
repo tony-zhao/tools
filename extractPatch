@@ -108,8 +108,8 @@ def parseFeatureName(content):
     for l in lines:
         m = prog.match(l)
         if m:
-            ret = m.group(1).strip().lower().translate(string.maketrans(' .:/-','_____'))
-            break
+            candi = m.group(1).strip().lower().translate(string.maketrans(' .:/-','_____'))
+            if len(candi) > 2: return candi
     return ret
 
 # return processed change count, 0 means no new change
