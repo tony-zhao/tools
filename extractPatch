@@ -28,9 +28,7 @@ MYNAME = os.path.splitext(os.path.basename(__file__))[0]
 logger = logging.getLogger(MYNAME)
 
 CPU_COUNT = multiprocessing.cpu_count()
-
-PROJECT_COUNT = 0
-CHANGE_COUNT = 0
+PATCHORDER_LIST = 'patchorder.list'
 #################################################################################
 
 class RawDescriptionArgumentDefaultsHelpFormatter(argparse.HelpFormatter):
@@ -126,18 +124,26 @@ def formatPatch(prjdir, upstream, head, outdir):
     # Count those that only exist in the <head> branch (prefixed with a plus symbol)
     revlist = [ c[2:] for c in out.strip().split('\n') if c.startswith('+ ') ]
     total = len(revlist)
-    current = 1
+    if total == 0:
+        info('[SKIP] "%s" no new change' % prjdir)
+        return 0
+    out = check_output(git4proj(prjdir) + ['remote'])
+    prjname = check_output(git4proj(prjdir) + ['config', '--get', 'remote.' + out.strip() + '.projectname'])
+    prjname = prjname.strip()
     info('[PROCESS] "%s" with %d changes' % (prjdir, total))
+    current = 1
     for r in revlist:
         debug('[PROCESSING] "%s" (%d/%d)' % (prjdir, current, total))
         current += 1
         content = getPatchFileContent(prjdir, r)
         featurename = parseFeatureName(content)
-        dstFile = os.path.join(outdir, featurename, getPatchFileName(prjdir, r))
+        patchfile = getPatchFileName(prjdir, r)
+        dstFile = os.path.join(outdir, featurename, patchfile)
         if not os.path.exists(os.path.dirname(dstFile)):
             os.makedirs(os.path.dirname(dstFile))
         with open(dstFile, 'w') as f:
             f.write(content)
+        logging.getLogger(PATCHORDER_LIST).critical('%s %s %s' % (prjname, featurename, os.path.splitext(patchfile)[0]))
     return total
 
 # return a dict with project_path:revision pairs
@@ -164,6 +170,17 @@ if __name__ == '__main__':
     opts = parseOption()
     logging.getLogger(MYNAME).setLevel(LOG_LVL[opts.log])
 
+    opts.output = tempfile.mkdtemp(prefix = MYNAME + '-', dir = opts.output)
+    info('Create output dir: ' + opts.output)
+
+    log = logging.getLogger(PATCHORDER_LIST)
+    fmt = logging.Formatter('%(message)s')
+    hdl = logging.FileHandler(os.path.join(opts.output, PATCHORDER_LIST))
+    hdl.setFormatter(fmt)
+    log.addHandler(hdl)
+    log.setLevel(logging.CRITICAL)
+    log.propagate = False
+
     repodir = findRepoRootDir()
     if repodir is None:
         error('Please run this script in repo source tree')
@@ -173,9 +190,6 @@ if __name__ == '__main__':
 
     proj_not_in_upstream = 0
     try:
-        opts.output = tempfile.mkdtemp(prefix = MYNAME + '-', dir = opts.output)
-        info('Create output dir: ' + opts.output)
-
         upstreamdict = parseManifest(opts.upstream)
         if opts.head == 'HEAD':
             headdict = dict([(p, 'HEAD') for p in getProjectList()])
@@ -204,14 +218,12 @@ if __name__ == '__main__':
         result = [r.get() for r in asyncResult if r.successful()]
         skipped = [i for i in result if i == 0]
         processed = [i for i in result if i != 0]
-        info('#'*60)
-        info('SUMMARY'.center(60))
-        info('%d projects skipped due to no corresponding projects in upstream' % proj_not_in_upstream)
-        info('%d projects skipped due to no new changes' % len(skipped))
-        info('%d projects processed with %d changes' % (len(processed), sum(processed)))
-        info('#'*60)
+        print '#'*80
+        print 'SUMMARY'.center(80)
+        print '%d projects skipped due to no corresponding projects in upstream' % proj_not_in_upstream
+        print '%d projects skipped due to no new changes' % len(skipped)
+        print '%d projects processed with %d changes' % (len(processed), sum(processed))
+        print '#'*80
     finally:
         os.chdir(CWD)
-        info('output directory : '.rjust(30) + opts.output)
-
-
+        print 'output directory :'.rjust(40), opts.output
