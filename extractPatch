@@ -106,8 +106,7 @@ def getProjectList():
 def parseFeatureName(content):
     ret = 'ungrouped_patches'
     lines = content.strip().split('\n')
-    #prog = re.compile(r'^\+.* ACOS_MOD_[^ ]* \{(.*)\}')
-    prog = re.compile(r'^\+.* ACOS_MOD_[^ ]* \{?([a-zA-Z0-9_ ]*)')
+    prog = re.compile(r'^\+.*ACOS_MOD_[^ ]* \{?([a-zA-Z0-9_ ]*)')
     for l in lines:
         m = prog.match(l)
         if m:
@@ -115,13 +114,14 @@ def parseFeatureName(content):
             break
     return ret
 
+# return processed change count, 0 means no new change
 def formatPatch(prjdir, upstream, head, outdir):
     debug('process start for "%s"' % prjdir)
     cmd = git4proj(prjdir) + ['cherry', str(upstream), str(head)]
     out = check_output(cmd)
     if len(out.strip()) == 0:
         info('[SKIP] "%s" no new change' % prjdir)
-        return
+        return 0
     # Skip the ones that have equivalent change already in the <upstream> branch (prefixed with a minus sign)
     # Count those that only exist in the <head> branch (prefixed with a plus symbol)
     revlist = [ c[2:] for c in out.strip().split('\n') if c.startswith('+ ') ]
@@ -138,6 +138,7 @@ def formatPatch(prjdir, upstream, head, outdir):
             os.makedirs(os.path.dirname(dstFile))
         with open(dstFile, 'w') as f:
             f.write(content)
+    return total
 
 # return a dict with project_path:revision pairs
 def parseManifest(manifest):
@@ -170,6 +171,7 @@ if __name__ == '__main__':
     CWD = os.getcwd()
     os.chdir(repodir)
 
+    proj_not_in_upstream = 0
     try:
         opts.output = tempfile.mkdtemp(prefix = MYNAME + '-', dir = opts.output)
         info('Create output dir: ' + opts.output)
@@ -188,6 +190,7 @@ if __name__ == '__main__':
                 if upstreamdict.has_key(k):
                     asyncResult.append(pool.apply_async(formatPatch, (k, upstreamdict[k], v, opts.output)))
                 else:
+                    proj_not_in_upstream += 1
                     info('[SKIP] "%s" not exist in upstream' % k)
             pool.close()
             pool.join()
@@ -198,9 +201,14 @@ if __name__ == '__main__':
         error('Exception: ' + str(e))
         error(traceback.format_exc())
     else:
+        result = [r.get() for r in asyncResult if r.successful()]
+        skipped = [i for i in result if i == 0]
+        processed = [i for i in result if i != 0]
         info('#'*60)
         info('SUMMARY'.center(60))
-        info('total processed: %d projects, %d changes' % (PROJECT_COUNT, CHANGE_COUNT))
+        info('%d projects skipped due to no corresponding projects in upstream' % proj_not_in_upstream)
+        info('%d projects skipped due to no new changes' % len(skipped))
+        info('%d projects processed with %d changes' % (len(processed), sum(processed)))
         info('#'*60)
     finally:
         os.chdir(CWD)
