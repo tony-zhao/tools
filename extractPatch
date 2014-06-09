@@ -1,0 +1,209 @@
+#!/usr/bin/python
+
+import os.path
+import re
+import string
+import argparse
+import logging
+import traceback
+import tempfile
+import multiprocessing
+import signal
+import exceptions
+import subprocess
+import xml.etree.ElementTree as ET
+
+FORMAT = "%(levelname)8s %(asctime)s [%(lineno)03d] %(message)s"
+DATEFMT = "%H:%M:%S"
+logging.basicConfig(level=logging.INFO, format=FORMAT, datefmt=DATEFMT)
+LOG_LVL = {
+    'd': logging.DEBUG,
+    'i': logging.INFO,
+    'w': logging.WARNING,
+    'e': logging.ERROR,
+    'c': logging.CRITICAL
+}
+
+MYNAME = os.path.splitext(os.path.basename(__file__))[0]
+logger = logging.getLogger(MYNAME)
+
+CPU_COUNT = multiprocessing.cpu_count()
+
+PROJECT_COUNT = 0
+CHANGE_COUNT = 0
+#################################################################################
+
+class RawDescriptionArgumentDefaultsHelpFormatter(argparse.HelpFormatter):
+    # RawDescriptionHelpFormatter
+    def _fill_text(self, text, width, indent):
+        return ''.join([indent + line for line in text.splitlines(True)])
+    # ArgumentDefaultsHelpFormatter
+    def _get_help_string(self, action):
+        help = action.help
+        if '%(default)' not in action.help:
+            if action.default is not argparse.SUPPRESS:
+                defaulting_nargs = [argparse.OPTIONAL, argparse.ZERO_OR_MORE]
+                if action.option_strings or action.nargs in defaulting_nargs:
+                    help += ' (default: %(default)s)'
+        return help
+
+def parseOption(args = None):
+    parser = argparse.ArgumentParser( \
+        description = '''
+''',
+        epilog = '''
+Python 2.7.x required
+''',
+        formatter_class = RawDescriptionArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('-l', '--log', default = 'i',
+                        choices = ['d', 'i', 'w', 'e', 'c'],
+                        help = 'specify log level')
+    parser.add_argument('-j', '--jobs', type = int, default = int(CPU_COUNT),
+                        help = 'specify the number of jobs to run simultaneously')
+    parser.add_argument('-o', '--output', default = None,
+                        help = 'specify output directory')
+    parser.add_argument('upstream', metavar = 'upstream',
+                        help = 'upstream branch to compare against, which is specified by a manifest file')
+    parser.add_argument('head', nargs = '?', metavar = 'head', default = 'HEAD',
+                        help = 'working branch, which is specified by a manifest file')
+    return parser.parse_args(args)
+
+#################################################################################
+def debug(msg):
+    logger.debug(multiprocessing.current_process().name + ' ' + msg)
+def info(msg):
+    logger.info(multiprocessing.current_process().name + ' ' + msg)
+def warning(msg):
+    logger.warning(multiprocessing.current_process().name + ' ' + msg)
+def error(msg):
+    logger.error(multiprocessing.current_process().name + ' ' + msg)
+def critical(msg):
+    logger.critical(multiprocessing.current_process().name + ' ' + msg)
+
+def check_call(cmd):
+    debug(' '.join(cmd))
+    return subprocess.check_call(cmd)
+def check_output(cmd):
+    debug(' '.join(cmd))
+    return subprocess.check_output(cmd, stderr = subprocess.STDOUT)
+
+def git4proj(prjDir):
+    return ['git', '--git-dir=' + os.path.join(prjDir, '.git'), '--work-tree=' + prjDir]
+def getPatchFileName(prjDir, revision):
+    out = check_output(git4proj(prjDir) + ['show', '--pretty=%h-%f', '-s', str(revision)])
+    out = out.strip()
+    if len(out) > 200:
+        return out[:200] + '.patch'
+    else:
+        return out + '.patch'
+def getPatchFileContent(prjDir, revision):
+    return check_output(git4proj(prjDir) + ['format-patch', '--stdout', '-1', str(revision)])
+def getProjectList():
+    out = check_output(['repo', 'list', '-p'])
+    return out.strip().split('\n')
+#################################################################################
+def parseFeatureName(content):
+    ret = 'ungrouped_patches'
+    lines = content.strip().split('\n')
+    #prog = re.compile(r'^\+.* ACOS_MOD_[^ ]* \{(.*)\}')
+    prog = re.compile(r'^\+.* ACOS_MOD_[^ ]* \{?([a-zA-Z0-9_ ]*)')
+    for l in lines:
+        m = prog.match(l)
+        if m:
+            ret = m.group(1).strip().lower().translate(string.maketrans(' .:/-','_____'))
+            break
+    return ret
+
+def formatPatch(prjdir, upstream, head, outdir):
+    debug('process start for "%s"' % prjdir)
+    cmd = git4proj(prjdir) + ['cherry', str(upstream), str(head)]
+    out = check_output(cmd)
+    if len(out.strip()) == 0:
+        info('[SKIP] "%s" no new change' % prjdir)
+        return
+    # Skip the ones that have equivalent change already in the <upstream> branch (prefixed with a minus sign)
+    # Count those that only exist in the <head> branch (prefixed with a plus symbol)
+    revlist = [ c[2:] for c in out.strip().split('\n') if c.startswith('+ ') ]
+    total = len(revlist)
+    current = 1
+    info('[PROCESS] "%s" with %d changes' % (prjdir, total))
+    for r in revlist:
+        debug('[PROCESSING] "%s" (%d/%d)' % (prjdir, current, total))
+        current += 1
+        content = getPatchFileContent(prjdir, r)
+        featurename = parseFeatureName(content)
+        dstFile = os.path.join(outdir, featurename, getPatchFileName(prjdir, r))
+        if not os.path.exists(os.path.dirname(dstFile)):
+            os.makedirs(os.path.dirname(dstFile))
+        with open(dstFile, 'w') as f:
+            f.write(content)
+
+# return a dict with project_path:revision pairs
+def parseManifest(manifest):
+    tree = ET.parse(manifest)
+    root = tree.getroot()
+    return dict([(p.get('path') or p.get('name'), p.get('revision')) for p in root.findall('project')])
+
+def findRepoRootDir(markup_file = '.repo/repo/repo'):
+    found = None
+    cwd = os.getcwd()
+    while found is None and cwd != '/':
+        if os.path.exists(os.path.join(cwd, markup_file)):
+            found = cwd
+            break
+        else:
+            cwd = os.path.dirname(cwd)
+    return found
+
+def initWorker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+if __name__ == '__main__':
+    opts = parseOption()
+    logging.getLogger(MYNAME).setLevel(LOG_LVL[opts.log])
+
+    repodir = findRepoRootDir()
+    if repodir is None:
+        error('Please run this script in repo source tree')
+        exit(1)
+    CWD = os.getcwd()
+    os.chdir(repodir)
+
+    try:
+        opts.output = tempfile.mkdtemp(prefix = MYNAME + '-', dir = opts.output)
+        info('Create output dir: ' + opts.output)
+
+        upstreamdict = parseManifest(opts.upstream)
+        if opts.head == 'HEAD':
+            headdict = dict([(p, 'HEAD') for p in getProjectList()])
+        else:
+            headdict = parseManifest(opts.head)
+
+        pool = multiprocessing.Pool(opts.jobs, initWorker)
+        try:
+            debug('Assign jobs to workers')
+            asyncResult = []
+            for k,v in headdict.items():
+                if upstreamdict.has_key(k):
+                    asyncResult.append(pool.apply_async(formatPatch, (k, upstreamdict[k], v, opts.output)))
+                else:
+                    info('[SKIP] "%s" not exist in upstream' % k)
+            pool.close()
+            pool.join()
+        except KeyboardInterrupt:
+            warning('Caught KeyboardInterrupt, terminating workers')
+            pool.terminate()
+    except Exception, e:
+        error('Exception: ' + str(e))
+        error(traceback.format_exc())
+    else:
+        info('#'*60)
+        info('SUMMARY'.center(60))
+        info('total processed: %d projects, %d changes' % (PROJECT_COUNT, CHANGE_COUNT))
+        info('#'*60)
+    finally:
+        os.chdir(CWD)
+        info('output directory : '.rjust(30) + opts.output)
+
+
