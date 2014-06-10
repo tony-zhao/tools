@@ -12,25 +12,62 @@ import signal
 import exceptions
 import subprocess
 import xml.etree.ElementTree as ET
+import sqlite3
 
-FORMAT = "%(levelname)8s %(asctime)s [%(lineno)03d] %(message)s"
-DATEFMT = "%H:%M:%S"
+#################################################################################
+# thread-safe file writer
+#################################################################################
+def initFileWriter(name, path = ''):
+    logger = logging.getLogger(name)
+    formatter = logging.Formatter('%(message)s')
+    handler = logging.FileHandler(os.path.join(path, name), 'w')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.CRITICAL)
+    logger.propagate = False
+def fileWrite(name, msg):
+    logging.getLogger(name).critical(msg)
+
+#################################################################################
+# logger utils
+#################################################################################
+FORMAT = '%(levelname)8s %(asctime)s [%(lineno)03d] %(message)s'
+DATEFMT = '%H:%M:%S'
 logging.basicConfig(level=logging.INFO, format=FORMAT, datefmt=DATEFMT)
 LOG_LVL = {
     'd': logging.DEBUG,
     'i': logging.INFO,
     'w': logging.WARNING,
     'e': logging.ERROR,
-    'c': logging.CRITICAL
+    #'c': logging.CRITICAL # critial level is used for thread-safe file writing
 }
 
 MYNAME = os.path.splitext(os.path.basename(__file__))[0]
 logger = logging.getLogger(MYNAME)
+handler = logging.FileHandler(MYNAME + '.log', 'w')
+handler.setFormatter(logging.Formatter(FORMAT, DATEFMT))
+logger.addHandler(handler)
 
+def debug(msg):
+    logger.debug(multiprocessing.current_process().name + ' ' + msg)
+def info(msg):
+    logger.info(multiprocessing.current_process().name + ' ' + msg)
+def warning(msg):
+    logger.warning(multiprocessing.current_process().name + ' ' + msg)
+def error(msg):
+    logger.error(multiprocessing.current_process().name + ' ' + msg)
+def critical(msg):
+    logger.critical(multiprocessing.current_process().name + ' ' + msg)
+
+#################################################################################
+# global variable declaration
+#################################################################################
 CPU_COUNT = multiprocessing.cpu_count()
 PATCHORDER_LIST = 'patchorder.list'
-#################################################################################
 
+#################################################################################
+# option utils
+#################################################################################
 class RawDescriptionArgumentDefaultsHelpFormatter(argparse.HelpFormatter):
     # RawDescriptionHelpFormatter
     def _fill_text(self, text, width, indent):
@@ -55,12 +92,14 @@ Python 2.7.x required
         formatter_class = RawDescriptionArgumentDefaultsHelpFormatter
     )
     parser.add_argument('-l', '--log', default = 'i',
-                        choices = ['d', 'i', 'w', 'e', 'c'],
+                        choices = ['d', 'i', 'w', 'e'],
                         help = 'specify log level')
     parser.add_argument('-j', '--jobs', type = int, default = int(CPU_COUNT),
                         help = 'specify the number of jobs to run simultaneously')
     parser.add_argument('-o', '--output', default = None,
                         help = 'specify output directory')
+    parser.add_argument('-a', '--analysis', default = False, action = 'store_true',
+                        help = 'analysis only, output no patches')
     parser.add_argument('upstream', metavar = 'upstream',
                         help = 'upstream branch to compare against, which is specified by a manifest file')
     parser.add_argument('head', nargs = '?', metavar = 'head', default = 'HEAD',
@@ -68,39 +107,50 @@ Python 2.7.x required
     return parser.parse_args(args)
 
 #################################################################################
-def debug(msg):
-    logger.debug(multiprocessing.current_process().name + ' ' + msg)
-def info(msg):
-    logger.info(multiprocessing.current_process().name + ' ' + msg)
-def warning(msg):
-    logger.warning(multiprocessing.current_process().name + ' ' + msg)
-def error(msg):
-    logger.error(multiprocessing.current_process().name + ' ' + msg)
-def critical(msg):
-    logger.critical(multiprocessing.current_process().name + ' ' + msg)
-
 def check_call(cmd):
     debug(' '.join(cmd))
-    return subprocess.check_call(cmd)
+    try:
+        ret = subprocess.check_call(cmd)
+    except Exception, e:
+        error('Exception: ' + str(e))
+        error(traceback.format_exc())
+        raise e
+    else:
+        return ret
 def check_output(cmd):
     debug(' '.join(cmd))
-    return subprocess.check_output(cmd, stderr = subprocess.STDOUT)
+    try:
+        out = subprocess.check_output(cmd, stderr = subprocess.STDOUT)
+        debug(out)
+    except Exception, e:
+        error('Exception: ' + str(e))
+        error(traceback.format_exc())
+        raise e
+    else:
+        return out
 
 def git4proj(prjDir):
     return ['git', '--git-dir=' + os.path.join(prjDir, '.git'), '--work-tree=' + prjDir]
-def getPatchFileName(prjDir, revision):
-    out = check_output(git4proj(prjDir) + ['show', '--pretty=%h-%f', '-s', str(revision)])
-    out = out.strip()
-    if len(out) > 200:
-        return out[:200] + '.patch'
-    else:
-        return out + '.patch'
+# return dictionary with patch information
+def getPatchInfo(prjDir, revision):
+    out = check_output(git4proj(prjDir) + ['show', '--pretty=%h%n%f%n%ae%n%H%n%s', '--name-only', str(revision)])
+    lines = out.strip().split('\n')
+    ret = dict()
+    ret['abbrHash']     = lines[0][:128].strip()
+    ret['saniSub']      = lines[1][:128].strip()
+    ret['authEmail']    = lines[2][:128].strip()
+    ret['hash']         = lines[3][:128].strip()
+    ret['subject']      = lines[4][:128].strip()
+    ret['file']         = ' '.join(lines[5:]).strip()
+    debug('getPatchInfo: ' + str(ret))
+    return ret
 def getPatchFileContent(prjDir, revision):
     return check_output(git4proj(prjDir) + ['format-patch', '--stdout', '-1', str(revision)])
 def getProjectList():
     out = check_output(['repo', 'list', '-p'])
     return out.strip().split('\n')
-#################################################################################
+    #return ['build']
+
 def parseFeatureName(content):
     ret = 'ungrouped_patches'
     lines = content.strip().split('\n')
@@ -134,16 +184,57 @@ def formatPatch(prjdir, upstream, head, outdir):
     current = 1
     for r in revlist:
         debug('[PROCESSING] "%s" (%d/%d)' % (prjdir, current, total))
-        current += 1
         content = getPatchFileContent(prjdir, r)
         featurename = parseFeatureName(content)
-        patchfile = getPatchFileName(prjdir, r)
+        pi = getPatchInfo(prjdir, r)
+        patchfile = pi['abbrHash'] + '-' + pi['saniSub'] + '.patch'
         dstFile = os.path.join(outdir, featurename, patchfile)
         if not os.path.exists(os.path.dirname(dstFile)):
             os.makedirs(os.path.dirname(dstFile))
         with open(dstFile, 'w') as f:
             f.write(content)
-        logging.getLogger(PATCHORDER_LIST).critical('%s %s %s' % (prjname, featurename, os.path.splitext(patchfile)[0]))
+        fileWrite(PATCHORDER_LIST, '%s %s %s' % (prjname, featurename, os.path.splitext(patchfile)[0]))
+        current += 1
+    return total
+
+def analysisPatch(prjdir, upstream, head):
+    debug('analysis start for "%s"' % prjdir)
+    cmd = git4proj(prjdir) + ['cherry', str(upstream), str(head)]
+    out = check_output(cmd)
+    if len(out.strip()) == 0:
+        info('[SKIP] "%s" no new change' % prjdir)
+        return 0
+    # Skip the ones that have equivalent change already in the <upstream> branch (prefixed with a minus sign)
+    # Count those that only exist in the <head> branch (prefixed with a plus symbol)
+    revlist = [ c[2:] for c in out.strip().split('\n') if c.startswith('+ ') ]
+    total = len(revlist)
+    if total == 0:
+        info('[SKIP] "%s" no new change' % prjdir)
+        return 0
+    out = check_output(git4proj(prjdir) + ['remote'])
+    prjname = check_output(git4proj(prjdir) + ['config', '--get', 'remote.' + out.strip() + '.projectname'])
+    prjname = prjname.strip()
+    hint = '[ANALYSIS] "%s" with %d changes\n' % (prjdir, total)
+    cmd = git4proj(prjdir) + ['show', '--pretty=%ae', '-s'] + revlist
+    out = check_output(cmd)
+    lines = out.strip().split('\n')
+    contributorList = [i.split('@')[1] for i in lines]
+    contributorSet = set(contributorList)
+    for i in contributorSet:
+        hint += str(contributorList.count(i)).rjust(10) + ' @ ' + i + '\n'
+    info(hint)
+    rows = []
+    current = 1
+    for r in revlist:
+        debug('[PROCESSING] "%s" (%d/%d)' % (prjdir, current, total))
+        content = getPatchFileContent(prjdir, r)
+        featurename = parseFeatureName(content)
+        pi = getPatchInfo(prjdir, r)
+        rows.append(
+            (pi['hash'], pi['subject'], pi['authEmail'].split('@')[1], prjname, featurename, pi['file'])
+        )
+        current += 1
+    insertDB(MYNAME + '.db', rows)
     return total
 
 # return a dict with project_path:revision pairs
@@ -163,6 +254,17 @@ def findRepoRootDir(markup_file = '.repo/repo/repo'):
             cwd = os.path.dirname(cwd)
     return found
 
+def initDB(filename):
+    if os.path.exists(filename):
+        os.remove(filename)
+    con = sqlite3.connect(filename)
+    con.execute('create table patch (sha1 text primary key, subject text, author text, project text, feature text, file text)')
+def insertDB(filename, seq):
+    con = sqlite3.connect(filename)
+    debug('SQLITE: ' + 'insert into patch values (?,?,?,?,?,?)' + str(seq))
+    con.executemany('insert into patch values (?,?,?,?,?,?)', seq)
+    con.commit()
+
 def initWorker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -173,13 +275,9 @@ if __name__ == '__main__':
     opts.output = tempfile.mkdtemp(prefix = MYNAME + '-', dir = opts.output)
     info('Create output dir: ' + opts.output)
 
-    log = logging.getLogger(PATCHORDER_LIST)
-    fmt = logging.Formatter('%(message)s')
-    hdl = logging.FileHandler(os.path.join(opts.output, PATCHORDER_LIST))
-    hdl.setFormatter(fmt)
-    log.addHandler(hdl)
-    log.setLevel(logging.CRITICAL)
-    log.propagate = False
+    initFileWriter(PATCHORDER_LIST)
+
+    initDB(MYNAME + '.db')
 
     repodir = findRepoRootDir()
     if repodir is None:
@@ -202,7 +300,12 @@ if __name__ == '__main__':
             asyncResult = []
             for k,v in headdict.items():
                 if upstreamdict.has_key(k):
-                    asyncResult.append(pool.apply_async(formatPatch, (k, upstreamdict[k], v, opts.output)))
+                    if opts.analysis:
+                        debug('analysisPatch(%s,%s,%s)' % (k, upstreamdict[k], v))
+                        asyncResult.append(pool.apply_async(analysisPatch, (k, upstreamdict[k], v)))
+                    else:
+                        debug('formatPatch(%s,%s,%s,%s)' % (k, upstreamdict[k], v, opts.output))
+                        asyncResult.append(pool.apply_async(formatPatch, (k, upstreamdict[k], v, opts.output)))
                 else:
                     proj_not_in_upstream += 1
                     info('[SKIP] "%s" not exist in upstream' % k)
@@ -215,7 +318,8 @@ if __name__ == '__main__':
         error('Exception: ' + str(e))
         error(traceback.format_exc())
     else:
-        result = [r.get() for r in asyncResult if r.successful()]
+        result = [r.get() for r in asyncResult]
+        debug('PoolWorkers Result: %s' % result)
         skipped = [i for i in result if i == 0]
         processed = [i for i in result if i != 0]
         print '#'*80
