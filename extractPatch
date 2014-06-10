@@ -197,7 +197,7 @@ def formatPatch(prjdir, upstream, head, outdir):
         current += 1
     return total
 
-def analysisPatch(prjdir, upstream, head):
+def analysisPatch(prjdir, upstream, head, mutex):
     debug('analysis start for "%s"' % prjdir)
     cmd = git4proj(prjdir) + ['cherry', str(upstream), str(head)]
     out = check_output(cmd)
@@ -234,7 +234,7 @@ def analysisPatch(prjdir, upstream, head):
             (pi['hash'], pi['subject'], pi['authEmail'].split('@')[1], prjname, featurename, pi['file'])
         )
         current += 1
-    insertDB(MYNAME + '.db', rows)
+    insertDB(MYNAME + '.db', rows, mutex)
     return total
 
 # return a dict with project_path:revision pairs
@@ -259,11 +259,14 @@ def initDB(filename):
         os.remove(filename)
     con = sqlite3.connect(filename)
     con.execute('create table patch (sha1 text primary key, subject text, author text, project text, feature text, file text)')
-def insertDB(filename, seq):
-    con = sqlite3.connect(filename)
+def insertDB(filename, seq, mutex):
     debug('SQLITE: ' + 'insert into patch values (?,?,?,?,?,?)' + str(seq))
+    mutex.acquire()
+    con = sqlite3.connect(filename)
+    con.text_factory = str
     con.executemany('insert into patch values (?,?,?,?,?,?)', seq)
     con.commit()
+    mutex.release()
 
 def initWorker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -295,14 +298,15 @@ if __name__ == '__main__':
             headdict = parseManifest(opts.head)
 
         pool = multiprocessing.Pool(opts.jobs, initWorker)
+        mutex = multiprocessing.Manager().Lock()
         try:
             debug('Assign jobs to workers')
             asyncResult = []
             for k,v in headdict.items():
                 if upstreamdict.has_key(k):
                     if opts.analysis:
-                        debug('analysisPatch(%s,%s,%s)' % (k, upstreamdict[k], v))
-                        asyncResult.append(pool.apply_async(analysisPatch, (k, upstreamdict[k], v)))
+                        debug('analysisPatch(%s,%s,%s,%s)' % (k, upstreamdict[k], v, mutex))
+                        asyncResult.append(pool.apply_async(analysisPatch, (k, upstreamdict[k], v, mutex)))
                     else:
                         debug('formatPatch(%s,%s,%s,%s)' % (k, upstreamdict[k], v, opts.output))
                         asyncResult.append(pool.apply_async(formatPatch, (k, upstreamdict[k], v, opts.output)))
